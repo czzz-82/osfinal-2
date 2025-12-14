@@ -1,3 +1,14 @@
+#define NMLFQ 5               // 5级优先级队列
+#define MAXPRIO (NMLFQ - 1)   // 最高优先级为0，最低为4
+
+// MLFQ队列结构
+struct mlfq_queue {
+  struct proc* procs[NPROC];  // 进程指针数组
+  int front;                  // 队列头
+  int rear;                   // 队列尾
+  int count;                  // 队列中进程数量
+};
+
 // Saved registers for kernel context switches.
 struct context {
   uint64 ra;
@@ -104,4 +115,18 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+  int priority;           // 当前优先级 (0最高, 4最低)
+  int ticks_in_queue;     // 在当前队列中运行的时间片数
+  uint64 entry_time;      // 进入当前队列的时间
 };
+// 声明全局变量
+extern struct mlfq_queue mlfq_queues[NMLFQ];
+extern int queue_time_slice[NMLFQ];
+extern struct spinlock mlfq_lock;
+
+// 函数声明
+void mlfq_init(void);
+void mlfq_remove(struct proc* p);
+void age_boost(void);
+// 新增：调度函数声明
+void schedule(void);

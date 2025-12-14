@@ -15,6 +15,13 @@ extern char trampoline[], uservec[], userret[];
 void kernelvec();
 
 extern int devintr();
+// 声明MLFQ函数
+void mlfq_enqueue(int priority, struct proc* p);
+void mlfq_remove(struct proc* p);
+void age_boost(void);
+
+// 声明MLFQ变量
+extern int queue_time_slice[NMLFQ];
 
 void
 trapinit(void)
@@ -77,8 +84,35 @@ usertrap(void)
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2)
-    yield();
+  if(which_dev == 2) {
+      // 时钟中断 - MLFQ处理
+      if(p != 0 && p->state == RUNNING) {
+        p->ticks_in_queue++;
+        
+        // 检查时间片是否用完
+        int time_slice = queue_time_slice[p->priority];
+        if(p->ticks_in_queue >= time_slice) {
+          // 时间片用完，降低优先级
+          int new_priority = p->priority + 1;
+          if(new_priority >= NMLFQ) {
+            new_priority = NMLFQ - 1;
+          }
+          
+          // 重新入队到更低优先级
+          mlfq_remove(p);
+          mlfq_enqueue(new_priority, p);
+          
+          // 让出CPU
+          yield();
+        }
+      }
+      
+      // 周期性提升优先级（防止饥饿）
+      if(ticks % 100 == 0) {
+        age_boost();
+      }
+    
+  } 
 
   usertrapret();
 }

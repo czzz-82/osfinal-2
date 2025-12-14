@@ -7,31 +7,186 @@
 #include "defs.h"
 
 struct cpu cpus[NCPU];
-
 struct proc proc[NPROC];
-
 struct proc *initproc;
-
+struct proc *idleproc;  // 空闲进程指针
 int nextpid = 1;
 struct spinlock pid_lock;
 
 extern void forkret(void);
 static void freeproc(struct proc *p);
+extern char trampoline[];
 
-extern char trampoline[]; // trampoline.S
-
-// helps ensure that wakeups of wait()ing
-// parents are not lost. helps obey the
-// memory model when using p->parent.
-// must be acquired before any p->lock.
+// 等待锁
 struct spinlock wait_lock;
 
-// Allocate a page for each process's kernel stack.
-// Map it high in memory, followed by an invalid
-// guard page.
-void
-proc_mapstacks(pagetable_t kpgtbl)
-{
+// MLFQ相关全局变量
+struct mlfq_queue mlfq_queues[NMLFQ];
+int queue_time_slice[NMLFQ] = {1, 2, 4, 8, 16};
+struct spinlock mlfq_lock;
+
+// MLFQ初始化
+void mlfq_init(void) {
+  initlock(&mlfq_lock, "mlfq");
+  for(int j = 0; j < NMLFQ; j++) {
+    mlfq_queues[j].front = 0;
+    mlfq_queues[j].rear = 0;
+    mlfq_queues[j].count = 0;
+  }
+}
+
+// 进程入队
+void mlfq_enqueue(int priority, struct proc* p) {
+  if(priority < 0) priority = 0;
+  if(priority >= NMLFQ) priority = NMLFQ - 1;
+  
+  acquire(&mlfq_lock);
+  
+  // 检查进程状态，ZOMBIE进程不应该入队
+  if(p->state != RUNNABLE) {
+    release(&mlfq_lock);
+    return;
+  }
+  
+  struct mlfq_queue* q = &mlfq_queues[priority];
+  if(q->count < NPROC) {
+    q->procs[q->rear] = p;
+    q->rear = (q->rear + 1) % NPROC;
+    q->count++;
+    
+    p->priority = priority;
+    p->ticks_in_queue = 0;
+    p->entry_time = ticks;
+  }
+  
+  release(&mlfq_lock);
+}
+
+// 进程出队
+struct proc* mlfq_dequeue(int priority) {
+  acquire(&mlfq_lock);
+  
+  struct proc* p = 0;
+  struct mlfq_queue* q = &mlfq_queues[priority];
+  
+  if(q->count > 0) {
+    p = q->procs[q->front];
+    q->front = (q->front + 1) % NPROC;
+    q->count--;
+  }
+  
+  release(&mlfq_lock);
+  return p;
+}
+
+// 从队列中移除进程
+void mlfq_remove(struct proc* p) {
+  if(p == 0 || p == idleproc) return;
+  
+  acquire(&mlfq_lock);
+  
+  struct mlfq_queue* q = &mlfq_queues[p->priority];
+  
+  // 线性搜索并移除
+  for(int i = 0; i < q->count; i++) {
+    int idx = (q->front + i) % NPROC;
+    if(q->procs[idx] == p) {
+      // 将后续元素前移
+      for(int j = i; j < q->count - 1; j++) {
+        int curr = (q->front + j) % NPROC;
+        int next = (q->front + j + 1) % NPROC;
+        q->procs[curr] = q->procs[next];
+      }
+      q->count--;
+      q->rear = (q->rear - 1 + NPROC) % NPROC;
+      break;
+    }
+  }
+  
+  release(&mlfq_lock);
+}
+
+// 周期性提升优先级（防止饥饿）
+void age_boost(void) {
+  acquire(&mlfq_lock);
+  
+  for(int prio = NMLFQ - 1; prio > 0; prio--) {
+    struct mlfq_queue* q = &mlfq_queues[prio];
+    
+    // 收集需要提升的进程
+    struct proc* boost_list[NPROC];
+    int boost_count = 0;
+    
+    for(int i = 0; i < q->count && boost_count < NPROC; i++) {
+      int idx = (q->front + i) % NPROC;
+      struct proc* p = q->procs[idx];
+      if(ticks - p->entry_time > 200) {  // 长时间未运行
+        boost_list[boost_count++] = p;
+      }
+    }
+    
+    // 提升收集到的进程
+    for(int i = 0; i < boost_count; i++) {
+      struct proc* p = boost_list[i];
+      mlfq_remove(p);
+      mlfq_enqueue(prio - 1, p);
+    }
+  }
+  
+  release(&mlfq_lock);
+}
+
+void schedule(void) {
+  struct proc *prev = myproc();  // 当前进程
+  struct proc *next = 0;
+  
+  // 关闭中断，保证原子性
+  push_off();
+  
+  // 只有在进程状态是RUNNING且不是空闲进程时才重新入队
+  // ZOMBIE进程不会被重新入队
+  if(prev && prev->state == RUNNING && prev != idleproc) {
+    prev->state = RUNNABLE;
+    mlfq_enqueue(prev->priority, prev);
+  }
+  
+  // 选择下一个进程，跳过ZOMBIE状态
+    
+    for(int prio = 0; prio < NMLFQ; prio++) {
+      next = mlfq_dequeue(prio);
+      if(next != 0 && next->state == RUNNABLE) {
+        goto found;
+      }
+      // 如果进程状态不是RUNNABLE，放回队列（如果需要的话）
+      if(next != 0) {
+        mlfq_enqueue(next->priority, next);
+        next = 0;
+      }
+    
+  }
+  
+found:
+  // 如果没有进程可运行，使用空闲进程
+  if(next == 0) {
+    next = idleproc;
+  }
+  
+  // 设置下一个进程状态
+  next->state = RUNNING;
+  mycpu()->proc = next;
+  
+  // 切换上下文
+  swtch(&prev->context, &next->context);
+  
+  // 切换回来后，更新CPU当前进程（可能已经改变）
+  mycpu()->proc = myproc();
+  
+  // 恢复中断
+  pop_off();
+}
+
+// 为每个进程分配内核栈页面
+void proc_mapstacks(pagetable_t kpgtbl) {
   struct proc *p;
   
   for(p = proc; p < &proc[NPROC]; p++) {
@@ -43,45 +198,57 @@ proc_mapstacks(pagetable_t kpgtbl)
   }
 }
 
-// initialize the proc table.
-void
-procinit(void)
-{
+// 初始化进程表
+void procinit(void) {
   struct proc *p;
   
   initlock(&pid_lock, "nextpid");
   initlock(&wait_lock, "wait_lock");
+  
+  // 初始化所有进程
   for(p = proc; p < &proc[NPROC]; p++) {
-      initlock(&p->lock, "proc");
-      p->state = UNUSED;
-      p->kstack = KSTACK((int) (p - proc));
+    initlock(&p->lock, "proc");
+    p->state = UNUSED;
+    p->kstack = KSTACK((int) (p - proc));
+    p->priority = 0;
+    p->ticks_in_queue = 0;
+    p->entry_time = 0;
   }
+  
+  // 初始化空闲进程（使用第一个进程槽位）
+  idleproc = &proc[0];
+  // 这里不需要锁，因为是在单核启动阶段
+  idleproc->state = RUNNABLE;
+  idleproc->pid = 0;
+  idleproc->priority = NMLFQ - 1;  // 最低优先级
+  safestrcpy(idleproc->name, "idle", sizeof(idleproc->name));
+  
+  // 初始化空闲进程的上下文
+  memset(&idleproc->context, 0, sizeof(idleproc->context));
+  idleproc->context.ra = (uint64)forkret;
+  idleproc->context.sp = idleproc->kstack + PGSIZE;
+  
+  // 空闲进程入队
+  mlfq_enqueue(idleproc->priority, idleproc);
+  
+  mlfq_init();  // 初始化MLFQ队列
 }
 
-// Must be called with interrupts disabled,
-// to prevent race with process being moved
-// to a different CPU.
-int
-cpuid()
-{
+// CPU ID
+int cpuid() {
   int id = r_tp();
   return id;
 }
 
-// Return this CPU's cpu struct.
-// Interrupts must be disabled.
-struct cpu*
-mycpu(void)
-{
+// 获取当前CPU
+struct cpu* mycpu(void) {
   int id = cpuid();
   struct cpu *c = &cpus[id];
   return c;
 }
 
-// Return the current struct proc *, or zero if none.
-struct proc*
-myproc(void)
-{
+// 获取当前进程
+struct proc* myproc(void) {
   push_off();
   struct cpu *c = mycpu();
   struct proc *p = c->proc;
@@ -89,9 +256,8 @@ myproc(void)
   return p;
 }
 
-int
-allocpid()
-{
+// 分配PID
+int allocpid() {
   int pid;
   
   acquire(&pid_lock);
@@ -102,16 +268,13 @@ allocpid()
   return pid;
 }
 
-// Look in the process table for an UNUSED proc.
-// If found, initialize state required to run in the kernel,
-// and return with p->lock held.
-// If there are no free procs, or a memory allocation fails, return 0.
-static struct proc*
-allocproc(void)
-{
+// 分配进程
+static struct proc* allocproc(void) {
   struct proc *p;
 
   for(p = proc; p < &proc[NPROC]; p++) {
+    if(p == idleproc) continue;  // 跳过空闲进程
+    
     acquire(&p->lock);
     if(p->state == UNUSED) {
       goto found;
@@ -125,14 +288,14 @@ found:
   p->pid = allocpid();
   p->state = USED;
 
-  // Allocate a trapframe page.
+  // 分配trapframe页
   if((p->trapframe = (struct trapframe *)kalloc()) == 0){
     freeproc(p);
     release(&p->lock);
     return 0;
   }
 
-  // An empty user page table.
+  // 创建空用户页表
   p->pagetable = proc_pagetable(p);
   if(p->pagetable == 0){
     freeproc(p);
@@ -140,21 +303,21 @@ found:
     return 0;
   }
 
-  // Set up new context to start executing at forkret,
-  // which returns to user space.
+  // 设置新上下文
   memset(&p->context, 0, sizeof(p->context));
   p->context.ra = (uint64)forkret;
   p->context.sp = p->kstack + PGSIZE;
 
+  // 初始化MLFQ字段
+  p->priority = 0;
+  p->ticks_in_queue = 0;
+  p->entry_time = ticks;
+  
   return p;
 }
 
-// free a proc structure and the data hanging from it,
-// including user pages.
-// p->lock must be held.
-static void
-freeproc(struct proc *p)
-{
+// 释放进程
+static void freeproc(struct proc *p) {
   if(p->trapframe)
     kfree((void*)p->trapframe);
   p->trapframe = 0;
@@ -171,30 +334,23 @@ freeproc(struct proc *p)
   p->state = UNUSED;
 }
 
-// Create a user page table for a given process, with no user memory,
-// but with trampoline and trapframe pages.
-pagetable_t
-proc_pagetable(struct proc *p)
-{
+// 创建进程页表
+pagetable_t proc_pagetable(struct proc *p) {
   pagetable_t pagetable;
 
-  // An empty page table.
+  // 创建空页表
   pagetable = uvmcreate();
   if(pagetable == 0)
     return 0;
 
-  // map the trampoline code (for system call return)
-  // at the highest user virtual address.
-  // only the supervisor uses it, on the way
-  // to/from user space, so not PTE_U.
+  // 映射trampoline代码
   if(mappages(pagetable, TRAMPOLINE, PGSIZE,
               (uint64)trampoline, PTE_R | PTE_X) < 0){
     uvmfree(pagetable, 0);
     return 0;
   }
 
-  // map the trapframe page just below the trampoline page, for
-  // trampoline.S.
+  // 映射trapframe页
   if(mappages(pagetable, TRAPFRAME, PGSIZE,
               (uint64)(p->trapframe), PTE_R | PTE_W) < 0){
     uvmunmap(pagetable, TRAMPOLINE, 1, 0);
@@ -205,19 +361,14 @@ proc_pagetable(struct proc *p)
   return pagetable;
 }
 
-// Free a process's page table, and free the
-// physical memory it refers to.
-void
-proc_freepagetable(pagetable_t pagetable, uint64 sz)
-{
+// 释放进程页表
+void proc_freepagetable(pagetable_t pagetable, uint64 sz) {
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
   uvmfree(pagetable, sz);
 }
 
-// a user program that calls exec("/init")
-// assembled from ../user/initcode.S
-// od -t xC ../user/initcode
+// initcode
 uchar initcode[] = {
   0x17, 0x05, 0x00, 0x00, 0x13, 0x05, 0x45, 0x02,
   0x97, 0x05, 0x00, 0x00, 0x93, 0x85, 0x35, 0x02,
@@ -228,37 +379,31 @@ uchar initcode[] = {
   0x00, 0x00, 0x00, 0x00
 };
 
-// Set up first user process.
-void
-userinit(void)
-{
+// 设置第一个用户进程
+void userinit(void) {
   struct proc *p;
 
   p = allocproc();
   initproc = p;
   
-  // allocate one user page and copy initcode's instructions
-  // and data into it.
+  // 分配用户页并复制initcode
   uvmfirst(p->pagetable, initcode, sizeof(initcode));
   p->sz = PGSIZE;
 
-  // prepare for the very first "return" from kernel to user.
-  p->trapframe->epc = 0;      // user program counter
-  p->trapframe->sp = PGSIZE;  // user stack pointer
+  // 准备从内核返回到用户空间
+  p->trapframe->epc = 0;      // 用户程序计数器
+  p->trapframe->sp = PGSIZE;  // 用户栈指针
 
   safestrcpy(p->name, "initcode", sizeof(p->name));
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
-
+  mlfq_enqueue(p->priority, p);
   release(&p->lock);
 }
 
-// Grow or shrink user memory by n bytes.
-// Return 0 on success, -1 on failure.
-int
-growproc(int n)
-{
+// 增长或缩小用户内存
+int growproc(int n) {
   uint64 sz;
   struct proc *p = myproc();
 
@@ -274,21 +419,18 @@ growproc(int n)
   return 0;
 }
 
-// Create a new process, copying the parent.
-// Sets up child kernel stack to return as if from fork() system call.
-int
-fork(void)
-{
+// 创建新进程
+int fork(void) {
   int i, pid;
   struct proc *np;
   struct proc *p = myproc();
 
-  // Allocate process.
+  // 分配进程
   if((np = allocproc()) == 0){
     return -1;
   }
 
-  // Copy user memory from parent to child.
+  // 从父进程复制用户内存到子进程
   if(uvmcopy(p->pagetable, np->pagetable, p->sz) < 0){
     freeproc(np);
     release(&np->lock);
@@ -296,13 +438,13 @@ fork(void)
   }
   np->sz = p->sz;
 
-  // copy saved user registers.
+  // 复制保存的用户寄存器
   *(np->trapframe) = *(p->trapframe);
 
-  // Cause fork to return 0 in the child.
+  // 在子进程中使fork返回0
   np->trapframe->a0 = 0;
 
-  // increment reference counts on open file descriptors.
+  // 增加打开文件描述符的引用计数
   for(i = 0; i < NOFILE; i++)
     if(p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
@@ -310,6 +452,10 @@ fork(void)
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
+  // 复制MLFQ字段
+  np->priority = p->priority;
+  np->ticks_in_queue = 0;
+  np->entry_time = ticks;
   pid = np->pid;
 
   release(&np->lock);
@@ -318,18 +464,15 @@ fork(void)
   np->parent = p;
   release(&wait_lock);
 
-  acquire(&np->lock);
+  // 这里不需要锁，因为np的状态只在这里设置
   np->state = RUNNABLE;
-  release(&np->lock);
+  mlfq_enqueue(np->priority, np);
 
   return pid;
 }
 
-// Pass p's abandoned children to init.
-// Caller must hold wait_lock.
-void
-reparent(struct proc *p)
-{
+// 重新分配子进程给init
+void reparent(struct proc *p) {
   struct proc *pp;
 
   for(pp = proc; pp < &proc[NPROC]; pp++){
@@ -339,19 +482,53 @@ reparent(struct proc *p)
     }
   }
 }
-
-// Exit the current process.  Does not return.
-// An exited process remains in the zombie state
-// until its parent calls wait().
-void
-exit(int status)
-{
+/*
+static void exit_schedule(void) {
+  struct proc *p = myproc();  // 当前进程，应该是ZOMBIE状态
+  struct proc *next = 0;
+  
+  // 关闭中断，保证原子性
+  push_off();
+  
+  // 选择下一个进程
+  for(int prio = 0; prio < NMLFQ; prio++) {
+    next = mlfq_dequeue(prio);
+    if(next != 0) {
+      break;
+    }
+  }
+  
+  // 如果没有进程可运行，使用空闲进程
+  if(next == 0) {
+    next = idleproc;
+  }
+  
+  // 设置下一个进程状态
+  next->state = RUNNING;
+  mycpu()->proc = next;
+  
+  // 切换上下文
+  swtch(&p->context, &next->context);
+  
+  // 如果切换回来（不应该发生），进入死循环
+  mycpu()->proc = myproc();
+  pop_off();
+  
+  // 不应该执行到这里
+  panic("zombie process scheduled again");
+}
+*/
+// 退出当前进程 - 最终版本
+void exit(int status) {
   struct proc *p = myproc();
-
+  
+  // 从MLFQ队列中移除
+  mlfq_remove(p);
+  
   if(p == initproc)
     panic("init exiting");
 
-  // Close all open files.
+  // 关闭所有打开的文件
   for(int fd = 0; fd < NOFILE; fd++){
     if(p->ofile[fd]){
       struct file *f = p->ofile[fd];
@@ -367,29 +544,29 @@ exit(int status)
 
   acquire(&wait_lock);
 
-  // Give any children to init.
+  // 将子进程交给init
   reparent(p);
 
-  // Parent might be sleeping in wait().
+  // 父进程可能在wait()中睡眠
   wakeup(p->parent);
   
-  acquire(&p->lock);
-
   p->xstate = status;
   p->state = ZOMBIE;
 
   release(&wait_lock);
-
-  // Jump into the scheduler, never to return.
-  sched();
+  
+// 专门用于退出的调度函数
+  schedule();
+  
+  // 永远不会执行到这里
   panic("zombie exit");
+  
 }
 
-// Wait for a child process to exit and return its pid.
-// Return -1 if this process has no children.
-int
-wait(uint64 addr)
-{
+
+
+// 等待子进程退出
+int wait(uint64 addr) {
   struct proc *pp;
   int havekids, pid;
   struct proc *p = myproc();
@@ -397,16 +574,14 @@ wait(uint64 addr)
   acquire(&wait_lock);
 
   for(;;){
-    // Scan through table looking for exited children.
+    // 扫描进程表查找退出的子进程
     havekids = 0;
     for(pp = proc; pp < &proc[NPROC]; pp++){
       if(pp->parent == p){
-        // make sure the child isn't still in exit() or swtch().
         acquire(&pp->lock);
-
         havekids = 1;
         if(pp->state == ZOMBIE){
-          // Found one.
+          // 找到一个
           pid = pp->pid;
           if(addr != 0 && copyout(p->pagetable, addr, (char *)&pp->xstate,
                                   sizeof(pp->xstate)) < 0) {
@@ -423,74 +598,39 @@ wait(uint64 addr)
       }
     }
 
-    // No point waiting if we don't have any children.
+    // 如果没有子进程，则无需等待
     if(!havekids || killed(p)){
       release(&wait_lock);
       return -1;
     }
     
-    // Wait for a child to exit.
-    sleep(p, &wait_lock);  //DOC: wait-sleep
+    // 等待子进程退出
+    sleep(p, &wait_lock);
   }
 }
 
-// Per-CPU process scheduler.
-// Each CPU calls scheduler() after setting itself up.
-// Scheduler never returns.  It loops, doing:
-//  - choose a process to run.
-//  - swtch to start running that process.
-//  - eventually that process transfers control
-//    via swtch back to the scheduler.
-void
-scheduler(void)
-{
-  struct proc *p;
+// 调度器 - 简化版本
+void scheduler(void) {
   struct cpu *c = mycpu();
-
-  c->proc = 0;
-  for(;;){
-    // The most recent process to run may have had interrupts
-    // turned off; enable them to avoid a deadlock if all
-    // processes are waiting.
+  
+  // 设置当前CPU的进程为空闲进程
+  c->proc = idleproc;
+  
+  // 空闲进程循环
+  for(;;) {
+    // 确保空闲进程在队列中
+    if(idleproc->state != RUNNABLE) {
+      idleproc->state = RUNNABLE;
+    }
+    
+    // 在空闲进程中循环
     intr_on();
-
-    int found = 0;
-    for(p = proc; p < &proc[NPROC]; p++) {
-      acquire(&p->lock);
-      if(p->state == RUNNABLE) {
-        // Switch to chosen process.  It is the process's job
-        // to release its lock and then reacquire it
-        // before jumping back to us.
-        p->state = RUNNING;
-        c->proc = p;
-        swtch(&c->context, &p->context);
-
-        // Process is done running for now.
-        // It should have changed its p->state before coming back.
-        c->proc = 0;
-        found = 1;
-      }
-      release(&p->lock);
-    }
-    if(found == 0) {
-      // nothing to run; stop running on this core until an interrupt.
-      intr_on();
-      asm volatile("wfi");
-    }
+    asm volatile("wfi");  // 等待中断，节省功耗
   }
 }
 
-// Switch to scheduler.  Must hold only p->lock
-// and have changed proc->state. Saves and restores
-// intena because intena is a property of this
-// kernel thread, not this CPU. It should
-// be proc->intena and proc->noff, but that would
-// break in the few places where a lock is held but
-// there's no process.
-void
-sched(void)
-{
-  int intena;
+// 调度切换
+void sched(void) {
   struct proc *p = myproc();
 
   if(!holding(&p->lock))
@@ -502,110 +642,112 @@ sched(void)
   if(intr_get())
     panic("sched interruptible");
 
-  intena = mycpu()->intena;
-  swtch(&p->context, &mycpu()->context);
-  mycpu()->intena = intena;
+  // 使用直接调度
+  schedule();
 }
 
-// Give up the CPU for one scheduling round.
-void
-yield(void)
-{
+// 放弃CPU
+void yield(void) {
   struct proc *p = myproc();
-  acquire(&p->lock);
-  p->state = RUNNABLE;
-  sched();
-  release(&p->lock);
+  
+  // 如果进程是ZOMBIE状态，不要重新入队
+  if(p->state == ZOMBIE) {
+    // 直接触发调度，但不会重新入队
+    push_off();
+    
+    struct proc *next = 0;
+    for(int prio = 0; prio < NMLFQ; prio++) {
+      next = mlfq_dequeue(prio);
+      if(next != 0) {
+        break;
+      }
+    }
+    
+    if(next == 0) {
+      next = idleproc;
+    }
+    
+    next->state = RUNNING;
+    mycpu()->proc = next;
+    
+    swtch(&p->context, &next->context);
+    
+    mycpu()->proc = myproc();
+    pop_off();
+  } else {
+    // 正常进程调用schedule
+    schedule();
+  }
 }
 
-// A fork child's very first scheduling by scheduler()
-// will swtch to forkret.
-void
-forkret(void)
-{
+// fork返回
+void forkret(void) {
   static int first = 1;
 
-  // Still holding p->lock from scheduler.
-  release(&myproc()->lock);
+  // 注意：我们不释放锁，因为锁没有被持有
 
   if (first) {
-    // File system initialization must be run in the context of a
-    // regular process (e.g., because it calls sleep), and thus cannot
-    // be run from main().
+    // 文件系统初始化必须在常规进程的上下文中运行
     fsinit(ROOTDEV);
-
     first = 0;
-    // ensure other cores see first=0.
     __sync_synchronize();
   }
 
   usertrapret();
 }
 
-// Atomically release lock and sleep on chan.
-// Reacquires lock when awakened.
-void
-sleep(void *chan, struct spinlock *lk)
-{
+// 睡眠
+void sleep(void *chan, struct spinlock *lk) {
   struct proc *p = myproc();
-  
-  // Must acquire p->lock in order to
-  // change p->state and then call sched.
-  // Once we hold p->lock, we can be
-  // guaranteed that we won't miss any wakeup
-  // (wakeup locks p->lock),
-  // so it's okay to release lk.
-
-  acquire(&p->lock);  //DOC: sleeplock1
+  //acquire(&p->lock);
+  // 释放调用者传递的锁
   release(lk);
-
-  // Go to sleep.
+  
+  // 设置睡眠状态
   p->chan = chan;
   p->state = SLEEPING;
-
-  sched();
-
-  // Tidy up.
+  
+  // 调用调度函数
+  schedule();
+  
+  // 当被唤醒后，继续执行到这里
+  // 清理状态
   p->chan = 0;
-
-  // Reacquire original lock.
-  release(&p->lock);
+  //release(&p->lock);
+  // 重新获取调用者传递的锁
   acquire(lk);
 }
 
-// Wake up all processes sleeping on chan.
-// Must be called without any p->lock.
-void
-wakeup(void *chan)
-{
+// 唤醒
+void wakeup(void *chan) {
   struct proc *p;
 
   for(p = proc; p < &proc[NPROC]; p++) {
-    if(p != myproc()){
-      acquire(&p->lock);
+    if(p != myproc() && p != idleproc){
+      // 原子比较和交换的方式来避免锁
       if(p->state == SLEEPING && p->chan == chan) {
         p->state = RUNNABLE;
+        // 唤醒的进程放入最高优先级（I/O密集型）
+        mlfq_enqueue(0, p);
       }
-      release(&p->lock);
     }
   }
 }
 
-// Kill the process with the given pid.
-// The victim won't exit until it tries to return
-// to user space (see usertrap() in trap.c).
-int
-kill(int pid)
-{
+// 杀死进程
+int kill(int pid) {
   struct proc *p;
 
   for(p = proc; p < &proc[NPROC]; p++){
+    if(p == idleproc) continue;
     acquire(&p->lock);
+    
     if(p->pid == pid){
       p->killed = 1;
       if(p->state == SLEEPING){
-        // Wake process from sleep().
         p->state = RUNNABLE;
+        mlfq_enqueue(p->priority, p);
+    
       }
       release(&p->lock);
       return 0;
@@ -615,31 +757,20 @@ kill(int pid)
   return -1;
 }
 
-void
-setkilled(struct proc *p)
-{
+// 设置进程为已杀死
+void setkilled(struct proc *p) {
   acquire(&p->lock);
   p->killed = 1;
   release(&p->lock);
 }
 
-int
-killed(struct proc *p)
-{
-  int k;
-  
-  acquire(&p->lock);
-  k = p->killed;
-  release(&p->lock);
-  return k;
+// 检查进程是否被杀死
+int killed(struct proc *p) {
+  return p->killed;
 }
 
-// Copy to either a user address, or kernel address,
-// depending on usr_dst.
-// Returns 0 on success, -1 on error.
-int
-either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
-{
+// 复制输出
+int either_copyout(int user_dst, uint64 dst, void *src, uint64 len) {
   struct proc *p = myproc();
   if(user_dst){
     return copyout(p->pagetable, dst, src, len);
@@ -649,12 +780,8 @@ either_copyout(int user_dst, uint64 dst, void *src, uint64 len)
   }
 }
 
-// Copy from either a user address, or kernel address,
-// depending on usr_src.
-// Returns 0 on success, -1 on error.
-int
-either_copyin(void *dst, int user_src, uint64 src, uint64 len)
-{
+// 复制输入
+int either_copyin(void *dst, int user_src, uint64 src, uint64 len) {
   struct proc *p = myproc();
   if(user_src){
     return copyin(p->pagetable, dst, src, len);
@@ -664,12 +791,8 @@ either_copyin(void *dst, int user_src, uint64 src, uint64 len)
   }
 }
 
-// Print a process listing to console.  For debugging.
-// Runs when user types ^P on console.
-// No lock to avoid wedging a stuck machine further.
-void
-procdump(void)
-{
+// 进程转储
+void procdump(void) {
   static char *states[] = {
   [UNUSED]    "unused",
   [USED]      "used",
